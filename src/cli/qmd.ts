@@ -78,6 +78,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { getEmbedModel, getLocalEmbedModel, isOllamaRemoteMode } from "../settings.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2304,7 +2305,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   };
 
   // Skip local LLM session when using remote Ollama for embeddings
-  if (process.env.OLLAMA_EMBED_URL) {
+  if (isOllamaRemoteMode()) {
     await runSearch();
   } else {
     await withLLMSession(runSearch, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
@@ -2449,7 +2450,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   };
 
   // Skip local LLM session when using remote Ollama for embeddings
-  if (process.env.OLLAMA_EMBED_URL) {
+  if (isOllamaRemoteMode()) {
     await runQuery();
   } else {
     await withLLMSession(runQuery, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
@@ -3098,7 +3099,10 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        const embedModel = isOllamaRemoteMode()
+          ? getEmbedModel()
+          : DEFAULT_EMBED_MODEL_URI;
+        await vectorIndex(embedModel, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,

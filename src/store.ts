@@ -26,7 +26,17 @@ import {
   withLLMSessionForLlm,
   type RerankDocument,
   type ILLMSession,
+  type EmbeddingResult,
 } from "./llm.js";
+import {
+  getOllamaUrl,
+  getEmbedModel,
+  getOllamaRerankModel,
+  isOllamaRemoteMode,
+  DEFAULT_EMBED_MODEL,
+  DEFAULT_RERANK_MODEL,
+  DEFAULT_QUERY_MODEL,
+} from "./settings.js";
 import type {
   NamedCollection,
   Collection,
@@ -40,12 +50,13 @@ import type {
 
 const HOME = process.env.HOME || "/tmp";
 
-// Remote Ollama embedding support — when OLLAMA_EMBED_URL is set, all embedding
-// and tokenization operations use the remote Ollama HTTP API instead of
-// node-llama-cpp. This enables QMD on platforms without local GPU/Vulkan
-// (ARM64 VPS, Docker, CI) and with remote Ollama instances (Tailscale, LAN).
-const OLLAMA_EMBED_URL = process.env.OLLAMA_EMBED_URL;
-const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
+// Remote Ollama embedding support — when OLLAMA_EMBED_URL is set (or configured
+// in settings.yml), all embedding and tokenization operations use the remote
+// Ollama HTTP API instead of node-llama-cpp. This enables QMD on platforms
+// without local GPU/Vulkan (ARM64 VPS, Docker, CI) and with remote Ollama
+// instances (Tailscale, LAN).
+const OLLAMA_EMBED_URL = getOllamaUrl();
+const OLLAMA_EMBED_MODEL = getEmbedModel();
 
 interface OllamaEmbedResult {
   embedding: number[];
@@ -75,9 +86,38 @@ async function ollamaEmbedBatch(texts: string[]): Promise<OllamaEmbedResult[]> {
   const data = await res.json() as { embeddings: number[][] };
   return data.embeddings.map(e => ({ embedding: e, model: OLLAMA_EMBED_MODEL }));
 }
-export const DEFAULT_EMBED_MODEL = "embeddinggemma";
-export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
+
+interface OllamaRerankResult {
+  score: number;
+  index: number;
+}
+
+/**
+ * Rerank documents using Ollama's /api/rerank endpoint.
+ * Used when OLLAMA_EMBED_URL is set and reranking is requested.
+ */
+async function ollamaRerank(
+  query: string,
+  documents: { text: string }[],
+  model: string,
+): Promise<OllamaRerankResult[]> {
+  if (documents.length === 0) return [];
+
+  const res = await fetch(`${OLLAMA_EMBED_URL}/api/rerank`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      query,
+      documents: documents.map(d => d.text),
+    }),
+  });
+  if (!res.ok) throw new Error(`Ollama rerank failed: ${res.status} ${await res.text()}`);
+  const data = await res.json() as { results: { index: number; score: number }[] };
+  return data.results.map(r => ({ score: r.score, index: r.index }));
+}
+
+export { DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL, DEFAULT_QUERY_MODEL } from "./settings.js";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
@@ -3332,19 +3372,45 @@ export async function rerank(query: string, documents: { file: string; text: str
     }
   }
 
-  // Rerank uncached documents using LlamaCpp
+  // Rerank uncached documents
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
-    const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    // Remote Ollama mode: use Ollama /api/rerank endpoint instead of local LlamaCpp
+    if (OLLAMA_EMBED_URL && !llmOverride) {
+      const rerankModel = getOllamaRerankModel();
+      const uncachedDocs = [...uncachedDocsByChunk.values()].map(d => ({ text: d.text }));
 
-    // Cache results by chunk text so identical chunks across files are scored once.
-    const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
-    for (const result of rerankResult.results) {
-      const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
-      setCachedResult(db, cacheKey, result.score.toString());
-      cachedResults.set(chunk, result.score);
+      try {
+        const rerankResults = await ollamaRerank(rerankQuery, uncachedDocs, rerankModel);
+
+        // Cache results by chunk text so identical chunks across files are scored once
+        const textByOriginal = new Map(uncachedDocs.map((d, i) => [i, d.text] as const));
+        for (const result of rerankResults) {
+          const originalIdx = result.index;
+          if (originalIdx >= 0 && originalIdx < uncachedDocs.length) {
+            const chunk = textByOriginal.get(originalIdx) || "";
+            const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: rerankModel, chunk });
+            setCachedResult(db, cacheKey, result.score.toString());
+            cachedResults.set(chunk, result.score);
+          }
+        }
+      } catch (error) {
+        console.warn(`⚠ Ollama rerank failed (${(error as Error).message}), skipping reranking`);
+        // Don't fail the whole search - uncached docs just get score 0
+      }
+    } else {
+      // Local reranking via LlamaCpp
+      const llm = llmOverride ?? getDefaultLlamaCpp();
+      const uncachedDocs = [...uncachedDocsByChunk.values()];
+      const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+
+      // Cache results by chunk text so identical chunks across files are scored once.
+      const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
+      for (const result of rerankResult.results) {
+        const chunk = textByFile.get(result.file) || "";
+        const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+        setCachedResult(db, cacheKey, result.score.toString());
+        cachedResults.set(chunk, result.score);
+      }
     }
   }
 
@@ -4102,11 +4168,17 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, llm.embedModelName));
+    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, isOllamaRemoteMode() ? OLLAMA_EMBED_MODEL : getLlm(store).embedModelName));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    let embeddings: EmbeddingResult[];
+    if (isOllamaRemoteMode()) {
+      const embedResults = await ollamaEmbedBatch(textsToEmbed);
+      embeddings = embedResults.map(r => ({ embedding: r.embedding, model: r.model }));
+    } else {
+      const llm = getLlm(store);
+      embeddings = (await llm.embedBatch(textsToEmbed)).filter((e): e is EmbeddingResult => e !== null);
+    }
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -4485,11 +4557,17 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, llm.embedModelName));
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, isOllamaRemoteMode() ? OLLAMA_EMBED_MODEL : getLlm(store).embedModelName));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      let embeddings: EmbeddingResult[];
+      if (isOllamaRemoteMode()) {
+        const embedResults = await ollamaEmbedBatch(textsToEmbed);
+        embeddings = embedResults.map(r => ({ embedding: r.embedding, model: r.model }));
+      } else {
+        const llm = getLlm(store);
+        embeddings = (await llm.embedBatch(textsToEmbed)).filter((e): e is EmbeddingResult => e !== null);
+      }
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
