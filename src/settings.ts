@@ -28,7 +28,7 @@ import YAML from "yaml";
 export interface OllamaSettings {
   url?: string;              // Ollama server URL (e.g., http://localhost:11434)
   embed_model?: string;      // Embedding model name (default: nomic-embed-text)
-  rerank_model?: string;     // Reranker model name (cross-encoder via generate API)
+  rerank_model?: string;     // Reserved: not used (Ollama lacks /api/rerank, bi-encoder uses embed_model)
   generate_model?: string;   // Text generation model for query expansion
 }
 
@@ -45,9 +45,12 @@ export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_OLLAMA_EMBED_MODEL = "nomic-embed-text";
 
-// Ollama supports reranking via /api/rerank endpoint (Ollama 0.5+).
-// In remote Ollama mode, reranking can use either Ollama API (if configured) or local LlamaCpp.
-// Configure via `ollama.rerank_model` in settings.yml or OLLAMA_RERANK_MODEL env var.
+// Ollama does NOT support a /api/rerank endpoint, and Qwen3-Reranker models on Ollama
+// do not function as rerankers (loaded as CausalLM without the sequence-classification
+// head needed for yes/no logit scoring). In remote Ollama mode, reranking uses the
+// bi-encoder approach: /api/embed for query + docs → cosine similarity.
+// The `ollama.rerank_model` setting is reserved for future use if Ollama adds /api/rerank.
+// Configure via `ollama.embed_model` in settings.yml or OLLAMA_EMBED_MODEL env var.
 
 // ============================================================================
 // Config paths

@@ -31,7 +31,6 @@ import {
 import {
   getOllamaUrl,
   getEmbedModel,
-  getOllamaRerankModel,
   isOllamaRemoteMode,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -93,28 +92,49 @@ interface OllamaRerankResult {
 }
 
 /**
- * Rerank documents using Ollama's /api/rerank endpoint.
- * Used when OLLAMA_EMBED_URL is set and reranking is requested.
+ * Rerank documents using Ollama's /api/embed endpoint with bi-encoder cosine similarity.
+ *
+ * Ollama does not provide a /api/rerank endpoint, and Qwen3-Reranker models on Ollama
+ * do not function as rerankers (they are loaded as generic CausalLM without the
+ * sequence-classification head needed for yes/no logit scoring). As a workaround,
+ * we use the embedding model to compute query-document similarity:
+ *
+ * 1. Embed the query using /api/embed
+ * 2. Embed all document chunks using /api/embed (batch)
+ * 3. Compute cosine similarity between query and each document embedding
+ * 4. Return scores sorted by similarity (descending)
+ *
+ * This is a bi-encoder approach — less powerful than a true cross-encoder but
+ * provides meaningful relevance differentiation without requiring a dedicated
+ * reranking API.
  */
-async function ollamaRerank(
+async function ollamaRerankBiEncoder(
   query: string,
   documents: { text: string }[],
-  model: string,
 ): Promise<OllamaRerankResult[]> {
   if (documents.length === 0) return [];
 
-  const res = await fetch(`${OLLAMA_EMBED_URL}/api/rerank`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      query,
-      documents: documents.map(d => d.text),
-    }),
+  // Embed query and documents in parallel
+  const [queryResult, docResults] = await Promise.all([
+    ollamaEmbed(query),
+    ollamaEmbedBatch(documents.map(d => d.text)),
+  ]);
+
+  const queryVec = queryResult.embedding!;
+
+  // Compute cosine similarity for each document
+  const results: OllamaRerankResult[] = docResults.map((doc, index) => {
+    const docVec = doc.embedding!;
+    const dot = queryVec.reduce((sum, v, i) => sum + v! * docVec[i]!, 0);
+    const normQ = Math.sqrt(queryVec.reduce((sum, v) => sum + v! * v!, 0));
+    const normD = Math.sqrt(docVec.reduce((sum, v) => sum + v! * v!, 0));
+    const cosine = normQ > 0 && normD > 0 ? dot / (normQ * normD) : 0;
+    return { score: cosine, index };
   });
-  if (!res.ok) throw new Error(`Ollama rerank failed: ${res.status} ${await res.text()}`);
-  const data = await res.json() as { results: { index: number; score: number }[] };
-  return data.results.map(r => ({ score: r.score, index: r.index }));
+
+  // Sort by score descending (highest similarity first)
+  results.sort((a, b) => b.score - a.score);
+  return results;
 }
 
 export { DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL, DEFAULT_QUERY_MODEL } from "./settings.js";
@@ -3374,13 +3394,16 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents
   if (uncachedDocsByChunk.size > 0) {
-    // Remote Ollama mode: use Ollama /api/rerank endpoint instead of local LlamaCpp
+    // Remote Ollama mode: bi-encoder reranking via /api/embed + cosine similarity
+    // Ollama has no /api/rerank endpoint, and Qwen3-Reranker models don't work as
+    // rerankers on Ollama (loaded as CausalLM without the sequence-classification
+    // head). We fall back to bi-encoder cosine similarity using the embed model.
     if (OLLAMA_EMBED_URL && !llmOverride) {
-      const rerankModel = getOllamaRerankModel();
       const uncachedDocs = [...uncachedDocsByChunk.values()].map(d => ({ text: d.text }));
+      const rerankModel = OLLAMA_EMBED_MODEL; // bi-encoder uses embed model, not reranker model
 
       try {
-        const rerankResults = await ollamaRerank(rerankQuery, uncachedDocs, rerankModel);
+        const rerankResults = await ollamaRerankBiEncoder(rerankQuery, uncachedDocs);
 
         // Cache results by chunk text so identical chunks across files are scored once
         const textByOriginal = new Map(uncachedDocs.map((d, i) => [i, d.text] as const));
